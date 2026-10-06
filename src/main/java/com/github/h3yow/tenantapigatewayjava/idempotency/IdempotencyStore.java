@@ -61,6 +61,38 @@ public class IdempotencyStore {
     }
 
     /**
+     * 原子地完成「查询 + 无记录时放置进行中占位」。
+     * <p>
+     * 并发下同键同内容的多个请求同时到达时，只有一个请求会看到 {@link LookupStatus#ABSENT}
+     * （表示它赢得了占位，负责真正调用上游，并且之后必须 {@link #settle} 或
+     * {@link #clearInProgress}）；其余请求看到 {@link LookupStatus#IN_PROGRESS}，
+     * 不得再发起上游调用。已落定终态返回 {@link LookupStatus#SETTLED}，不改动记录。
+     */
+    public Lookup lookupOrMarkInProgress(String tenantId, String idempotencyKey, String payload) {
+        String k = key(tenantId, idempotencyKey);
+        Lookup[] outcome = new Lookup[1];
+        entries.compute(k, (id, existing) -> {
+            if (existing == null) {
+                outcome[0] = new Lookup(LookupStatus.ABSENT, true, null);
+                log.info("idempotent-mark-in-progress tenant={} key={}", tenantId, idempotencyKey);
+                return new Entry(payload, null, false);
+            }
+            boolean same = existing.payload().equals(payload);
+            if (existing.settled()) {
+                log.info("idempotent-hit tenant={} key={} samePayload={} replay=true",
+                        tenantId, idempotencyKey, same);
+                outcome[0] = new Lookup(LookupStatus.SETTLED, same, existing.result());
+            } else {
+                log.info("idempotent-in-progress tenant={} key={} samePayload={}",
+                        tenantId, idempotencyKey, same);
+                outcome[0] = new Lookup(LookupStatus.IN_PROGRESS, same, null);
+            }
+            return existing;
+        });
+        return outcome[0];
+    }
+
+    /**
      * 为幂等键放置“进行中”占位；若已被其他请求占位则返回 false。
      */
     public boolean markInProgress(String tenantId, String idempotencyKey, String payload) {

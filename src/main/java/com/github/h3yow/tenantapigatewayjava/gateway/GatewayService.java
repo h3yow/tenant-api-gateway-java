@@ -18,12 +18,17 @@ import org.springframework.stereotype.Service;
 /**
  * 网关编排。处理顺序（既有入口与调用约定不变）：
  * <pre>
- *   1. 幂等折叠：已落定终态且同键同内容 -> 直接重放，不经过熔断/配额/并发，也不调用上游
- *                同键不同内容 -> 幂等冲突拒绝
+ *   1. 幂等折叠（原子“查询或占位”）：
+ *      - 已落定终态且同键同内容 -> 直接重放，不经过熔断/配额/并发，也不调用上游
+ *      - 同键不同内容 -> 幂等冲突拒绝
+ *      - 同键同内容已有请求在途 -> “处理中”提示，不重复打上游、不占任何网关资源
+ *      - 无任何记录 -> 原子占位为“进行中”，同一键同一时刻只有一笔请求能进入后续环节
  *   2. 租户熔断准入：OPEN/HALF_OPEN 下非探测请求快速失败（不占配额、不在途、不暴露上游异常）
  *   3. 窗口配额：只有真正要调上游的请求才占名额；之后若被并发挡下则归还
  *   4. 在途并发：达上限快速失败并归还配额
  *   5. 调用上游：成功写幂等终态；失败记熔断计数并归一化错误
+ *   持有“进行中”占位的请求，在第 2~5 步任何一处被挡下或失败时都会清除占位，
+ *   保证同键请求之后可以重试，且占位本身不消耗窗口配额、不占用在途名额。
  * </pre>
  */
 @Service
@@ -61,9 +66,13 @@ public class GatewayService {
         String payload = request.payload();
         boolean hasKey = key != null && !key.isBlank();
 
-        // 1. 幂等折叠：终态重放优先于一切（含熔断打开期间）。
+        // 1. 幂等折叠：原子“查询或占位”。终态重放优先于一切（含熔断打开期间）；
+        //    同键并发到达时只有一个请求能赢得占位进入后续环节，其余立即以“处理中”返回，
+        //    不重复打上游，也不消耗配额/在途名额。
+        boolean markedInProgress = false;
         if (hasKey) {
-            IdempotencyStore.Lookup lookup = idempotencyStore.lookup(tenantId, key, payload);
+            IdempotencyStore.Lookup lookup =
+                    idempotencyStore.lookupOrMarkInProgress(tenantId, key, payload);
             if (lookup.status() == IdempotencyStore.LookupStatus.SETTLED) {
                 if (!lookup.samePayload()) {
                     return auditAndReturn(request, DecisionCode.REJECT_IDEMPOTENT_CONFLICT,
@@ -85,6 +94,8 @@ public class GatewayService {
                         GatewayResponse.of(DecisionCode.REJECT_IDEMPOTENT_IN_PROGRESS,
                                 "IDEMPOTENT_IN_PROGRESS", true, 1L, null));
             }
+            // ABSENT：本请求赢得占位，负责真正调用上游；之后任何提前返回都必须清除占位。
+            markedInProgress = true;
         }
 
         TenantCircuitBreaker breaker = circuitBreakerRegistry.forTenant(tenantId);
@@ -92,6 +103,9 @@ public class GatewayService {
         // 2. 租户熔断准入。
         Admission admission = breaker.admit();
         if (!admission.permitted()) {
+            if (markedInProgress) {
+                idempotencyStore.clearInProgress(tenantId, key);
+            }
             DecisionCode code = admission.probeFailurePenalty()
                     ? DecisionCode.REJECT_PROBE_FAILED : DecisionCode.REJECT_CIRCUIT_OPEN;
             String reason = admission.probeFailurePenalty()
@@ -103,6 +117,9 @@ public class GatewayService {
 
         // 3. 窗口配额（只有真正要调上游的请求才消耗）。
         if (!quotaLimiter.tryAcquire(tenantId, properties.getWindowSeconds(), properties.getWindowLimit())) {
+            if (markedInProgress) {
+                idempotencyStore.clearInProgress(tenantId, key);
+            }
             return auditAndReturn(request, DecisionCode.REJECT_QUOTA_EXHAUSTED,
                     GatewayResponse.of(DecisionCode.REJECT_QUOTA_EXHAUSTED, "QUOTA_EXHAUSTED",
                             true, (long) properties.getWindowSeconds(), null));
@@ -111,14 +128,12 @@ public class GatewayService {
         // 4. 在途并发（拿不到名额要归还刚刚占用的窗口配额）。
         if (!concurrencyLimiter.tryAcquire(tenantId, properties.getMaxConcurrent())) {
             quotaLimiter.release(tenantId, properties.getWindowSeconds());
+            if (markedInProgress) {
+                idempotencyStore.clearInProgress(tenantId, key);
+            }
             return auditAndReturn(request, DecisionCode.REJECT_CONCURRENCY_LIMITED,
                     GatewayResponse.of(DecisionCode.REJECT_CONCURRENCY_LIMITED, "CONCURRENCY_LIMITED",
                             true, 1L, null));
-        }
-
-        boolean markedInProgress = false;
-        if (hasKey && idempotencyStore.markInProgress(tenantId, key, payload)) {
-            markedInProgress = true;
         }
 
         try {

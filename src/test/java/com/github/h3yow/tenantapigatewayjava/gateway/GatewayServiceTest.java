@@ -264,40 +264,53 @@ class GatewayServiceTest {
 
     @Test
     void concurrentRequestsDoNotBurstThroughDuringProbe() throws Exception {
-        makeFailures("t1", 3);
+        // 阻塞式上游：探测请求进入后停在“上游调用中”，保证其余请求到达时熔断器
+        // 确定处于 HALF_OPEN 且探测名额已用完——不依赖线程调度时序，重复运行稳定。
+        java.util.concurrent.CountDownLatch entered = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.atomic.AtomicBoolean healthy = new java.util.concurrent.atomic.AtomicBoolean(false);
+        UpstreamInvoker blocking = (tenant, data) -> {
+            if (!healthy.get()) {
+                throw new java.net.SocketTimeoutException("simulated upstream timeout");
+            }
+            entered.countDown();
+            release.await();
+            return "ok:" + tenant + ":" + data;
+        };
+        GatewayService blockingService = new GatewayService(
+                quotaLimiter, concurrencyLimiter, idempotencyStore,
+                blocking, new UpstreamExceptionNormalizer(), registry, properties);
+
+        // 熔断打开并熬过冷静期，上游随后恢复
+        for (int i = 0; i < 3; i++) {
+            blockingService.handle(req("t1", null, "p", "d"));
+        }
         clock.advance(10_000L);
+        healthy.set(true);
 
-        int threads = 20;
-        java.util.concurrent.CountDownLatch start = new java.util.concurrent.CountDownLatch(1);
-        java.util.List<GatewayResponse> responses =
-                java.util.Collections.synchronizedList(new java.util.ArrayList<>());
-        java.util.List<Thread> workers = new java.util.ArrayList<>();
-        for (int i = 0; i < threads; i++) {
-            Thread worker = new Thread(() -> {
-                try {
-                    start.await();
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                }
-                responses.add(service.handle(req("t1", null, "p", "d")));
-            });
-            workers.add(worker);
-            worker.start();
-        }
-        start.countDown();
-        for (Thread worker : workers) {
-            worker.join();
+        // 探测请求在后台线程发起，并确定性地停在上游调用中
+        java.util.concurrent.atomic.AtomicReference<GatewayResponse> probeRef =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        Thread probeThread = new Thread(
+                () -> probeRef.set(blockingService.handle(req("t1", null, "p", "d"))));
+        probeThread.setDaemon(true);
+        probeThread.start();
+        org.junit.jupiter.api.Assertions.assertTrue(
+                entered.await(5, java.util.concurrent.TimeUnit.SECONDS), "探测请求应进入上游");
+
+        // 探测在途期间，其余请求一律快速失败，无一穿透
+        for (int i = 0; i < 20; i++) {
+            GatewayResponse r = blockingService.handle(req("t1", null, "p", "d"));
+            assertEquals(DecisionCode.REJECT_CIRCUIT_OPEN, r.decision(),
+                    "探测在途期间其余请求必须被快速失败");
         }
 
-        long probes = responses.stream().filter(r -> r.decision() == DecisionCode.PASS_PROBE).count();
-        long openRejects = responses.stream()
-                .filter(r -> r.decision() == DecisionCode.REJECT_CIRCUIT_OPEN
-                        || r.decision() == DecisionCode.REJECT_PROBE_FAILED).count();
-        assertEquals(1, probes, "冷静期后只能有 1 个探测请求穿透");
-        assertEquals(threads - 1, openRejects, "其余并发请求必须被快速失败");
+        release.countDown();
+        probeThread.join(5_000L);
+        assertEquals(DecisionCode.PASS_PROBE, probeRef.get().decision(), "唯一的探测请求应放行成功");
 
-        // 探测成功后恢复
-        assertEquals(DecisionCode.PASS, service.handle(req("t1", null, "p", "d")).decision());
+        // 探测成功后整体恢复
+        assertEquals(DecisionCode.PASS, blockingService.handle(req("t1", null, "p", "d")).decision());
     }
 
     @Test
@@ -325,6 +338,28 @@ class GatewayServiceTest {
         GatewayResponse nextProbe = service.handle(req("t1", null, "p", "d"));
         assertEquals(DecisionCode.PASS_PROBE, nextProbe.decision());
         assertEquals(DecisionCode.PASS, service.handle(req("t1", null, "p", "d")).decision());
+    }
+
+    @Test
+    void keyedRequestRejectedByCircuitLeavesNoResidueAndCanRetryAfterRecovery() {
+        makeFailures("t1", 3); // 熔断打开
+
+        // 熔断期间带键新请求被快速失败：不占配额、不留幂等占位
+        GatewayResponse blocked = service.handle(req("t1", "k9", "body", "d"));
+        assertEquals(DecisionCode.REJECT_CIRCUIT_OPEN, blocked.decision());
+
+        // 冷静期后探测恢复；同键请求应作为全新请求真正调用上游（占位已清除）
+        clock.advance(10_000L);
+        GatewayResponse probe = service.handle(req("t1", null, "p", "d"));
+        assertEquals(DecisionCode.PASS_PROBE, probe.decision());
+
+        GatewayResponse retry = service.handle(req("t1", "k9", "body", "d"));
+        assertEquals(DecisionCode.PASS, retry.decision());
+        assertEquals("ok:t1:d", retry.result());
+
+        // 落定后正常折叠重放
+        GatewayResponse replay = service.handle(req("t1", "k9", "body", "d"));
+        assertEquals(DecisionCode.IDEMPOTENT_REPLAY, replay.decision());
     }
 
     @Test
