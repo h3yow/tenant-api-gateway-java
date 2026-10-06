@@ -21,10 +21,15 @@ import org.springframework.stereotype.Service;
  *   1. 幂等折叠：已落定终态且同键同内容 -> 直接重放，不经过熔断/配额/并发，也不调用上游
  *                同键不同内容 -> 幂等冲突拒绝
  *   2. 租户熔断准入：OPEN/HALF_OPEN 下非探测请求快速失败（不占配额、不在途、不暴露上游异常）
- *   3. 窗口配额：只有真正要调上游的请求才占名额；之后若被并发挡下则归还
- *   4. 在途并发：达上限快速失败并归还配额
- *   5. 调用上游：成功写幂等终态；失败记熔断计数并归一化错误
+ *   3. 幂等键认领：原子占位，同一键同一时刻最多一个请求继续往下走；
+ *      没抢到的请求按当时状态折叠（终态重放 / 内容冲突 / 处理中），
+ *      不消耗窗口配额、不占在途名额、不打上游
+ *   4. 窗口配额：只有真正要调上游的请求才占名额；之后若被并发挡下则归还
+ *   5. 在途并发：达上限快速失败并归还配额
+ *   6. 调用上游：成功写幂等终态；失败记熔断计数并归一化错误
  * </pre>
+ * 认领占位之后、真正调用上游之前被挡下（配额/并发）的请求，会清掉占位并归还已占资源，
+ * 与熔断快速失败一样不留下任何资源占用。
  */
 @Service
 public class GatewayService {
@@ -101,24 +106,56 @@ public class GatewayService {
                     GatewayResponse.of(code, reason, true, retryAfterSeconds, null));
         }
 
-        // 3. 窗口配额（只有真正要调上游的请求才消耗）。
+        // 3. 幂等键认领：同一键同一时刻最多一个请求继续走向上游。
+        //    并发下同键请求只会有一个认领成功；没抢到的按当时状态折叠返回，
+        //    不消耗窗口配额、不占在途名额、不重复打上游。
+        if (hasKey) {
+            while (true) {
+                if (idempotencyStore.markInProgress(tenantId, key, payload)) {
+                    break;
+                }
+                IdempotencyStore.Lookup raced = idempotencyStore.lookup(tenantId, key, payload);
+                if (raced.status() == IdempotencyStore.LookupStatus.ABSENT) {
+                    // 前一个持有方刚失败并清掉了占位：重试认领，由本请求接替发起调用。
+                    continue;
+                }
+                if (!raced.samePayload()) {
+                    return auditAndReturn(request, DecisionCode.REJECT_IDEMPOTENT_CONFLICT,
+                            GatewayResponse.of(DecisionCode.REJECT_IDEMPOTENT_CONFLICT,
+                                    "IDEMPOTENT_KEY_PAYLOAD_CONFLICT", false, null, null));
+                }
+                if (raced.status() == IdempotencyStore.LookupStatus.SETTLED) {
+                    // 并发竞争期间前一个请求已落定：直接折叠重放终态。
+                    return auditAndReturn(request, DecisionCode.IDEMPOTENT_REPLAY,
+                            GatewayResponse.of(DecisionCode.IDEMPOTENT_REPLAY, "IDEMPOTENT_REPLAY",
+                                    false, null, raced.result()));
+                }
+                // 同键同内容已有请求在途：返回“处理中”，不重复打上游。
+                return auditAndReturn(request, DecisionCode.REJECT_IDEMPOTENT_IN_PROGRESS,
+                        GatewayResponse.of(DecisionCode.REJECT_IDEMPOTENT_IN_PROGRESS,
+                                "IDEMPOTENT_IN_PROGRESS", true, 1L, null));
+            }
+        }
+
+        // 4. 窗口配额（只有真正要调上游的请求才消耗）。
         if (!quotaLimiter.tryAcquire(tenantId, properties.getWindowSeconds(), properties.getWindowLimit())) {
+            if (hasKey) {
+                idempotencyStore.clearInProgress(tenantId, key);
+            }
             return auditAndReturn(request, DecisionCode.REJECT_QUOTA_EXHAUSTED,
                     GatewayResponse.of(DecisionCode.REJECT_QUOTA_EXHAUSTED, "QUOTA_EXHAUSTED",
                             true, (long) properties.getWindowSeconds(), null));
         }
 
-        // 4. 在途并发（拿不到名额要归还刚刚占用的窗口配额）。
+        // 5. 在途并发（拿不到名额要归还刚刚占用的窗口配额，并清掉幂等占位）。
         if (!concurrencyLimiter.tryAcquire(tenantId, properties.getMaxConcurrent())) {
             quotaLimiter.release(tenantId, properties.getWindowSeconds());
+            if (hasKey) {
+                idempotencyStore.clearInProgress(tenantId, key);
+            }
             return auditAndReturn(request, DecisionCode.REJECT_CONCURRENCY_LIMITED,
                     GatewayResponse.of(DecisionCode.REJECT_CONCURRENCY_LIMITED, "CONCURRENCY_LIMITED",
                             true, 1L, null));
-        }
-
-        boolean markedInProgress = false;
-        if (hasKey && idempotencyStore.markInProgress(tenantId, key, payload)) {
-            markedInProgress = true;
         }
 
         try {
@@ -126,9 +163,9 @@ public class GatewayService {
             try {
                 result = upstreamInvoker.invoke(tenantId, request.data());
             } catch (Exception error) {
-                // 5a. 上游失败：记熔断计数，归一化错误，绝不把原始异常抛给调用方。
+                // 6a. 上游失败：记熔断计数，归一化错误，绝不把原始异常抛给调用方。
                 breaker.recordFailure(admission.probe());
-                if (markedInProgress) {
+                if (hasKey) {
                     idempotencyStore.clearInProgress(tenantId, key);
                 }
                 String normalized = normalizer.normalize(error);
@@ -141,9 +178,9 @@ public class GatewayService {
                                 null));
             }
 
-            // 5b. 上游成功：探测成功整体恢复；写幂等终态。
+            // 6b. 上游成功：探测成功整体恢复；写幂等终态。
             breaker.recordSuccess(admission.probe());
-            if (markedInProgress) {
+            if (hasKey) {
                 idempotencyStore.settle(tenantId, key, payload, result);
             }
             DecisionCode code = admission.probe() ? DecisionCode.PASS_PROBE : DecisionCode.PASS;

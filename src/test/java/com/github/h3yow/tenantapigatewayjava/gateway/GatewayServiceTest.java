@@ -21,6 +21,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class GatewayServiceTest {
 
+    private static final org.slf4j.Logger log = org.slf4j.LoggerFactory.getLogger(GatewayServiceTest.class);
+
     private MutableTimeSource clock;
     private GatewayProperties properties;
     private StubUpstreamInvoker upstream;
@@ -264,9 +266,40 @@ class GatewayServiceTest {
 
     @Test
     void concurrentRequestsDoNotBurstThroughDuringProbe() throws Exception {
-        makeFailures("t1", 3);
+        // 确定性用例：探测请求被“停”在上游调用里，熔断器保持在 HALF_OPEN 且名额已用尽；
+        // 此时其余并发请求无论调度顺序如何都必须被快速失败，不依赖线程时序。
+        CircuitBreakerRegistry sharedRegistry = new CircuitBreakerRegistry(clock, properties);
+        UpstreamInvoker failing = (tenant, data) -> {
+            throw new java.net.SocketTimeoutException("simulated upstream timeout");
+        };
+        GatewayService failingService = new GatewayService(
+                quotaLimiter, concurrencyLimiter, idempotencyStore,
+                failing, new UpstreamExceptionNormalizer(), sharedRegistry, properties);
+        for (int i = 0; i < 3; i++) {
+            failingService.handle(req("t1", null, "p", "d"));
+        }
         clock.advance(10_000L);
 
+        java.util.concurrent.CountDownLatch probeEntered = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch releaseProbe = new java.util.concurrent.CountDownLatch(1);
+        UpstreamInvoker blocking = (tenant, data) -> {
+            probeEntered.countDown();
+            releaseProbe.await();
+            return "ok:" + tenant + ":" + data;
+        };
+        GatewayService blockingService = new GatewayService(
+                quotaLimiter, concurrencyLimiter, idempotencyStore,
+                blocking, new UpstreamExceptionNormalizer(), sharedRegistry, properties);
+
+        // 唯一的探测请求进入上游并停住（此时熔断器 HALF_OPEN、探测名额已用尽）
+        java.util.concurrent.atomic.AtomicReference<GatewayResponse> probeResponse =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        Thread probeThread = new Thread(
+                () -> probeResponse.set(blockingService.handle(req("t1", null, "p", "probe-data"))));
+        probeThread.start();
+        probeEntered.await();
+
+        // 探测在途期间：20 个并发请求全部必须被快速失败，一个都不许穿透到上游
         int threads = 20;
         java.util.concurrent.CountDownLatch start = new java.util.concurrent.CountDownLatch(1);
         java.util.List<GatewayResponse> responses =
@@ -279,7 +312,7 @@ class GatewayServiceTest {
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                 }
-                responses.add(service.handle(req("t1", null, "p", "d")));
+                responses.add(blockingService.handle(req("t1", null, "p", "d")));
             });
             workers.add(worker);
             worker.start();
@@ -289,15 +322,17 @@ class GatewayServiceTest {
             worker.join();
         }
 
-        long probes = responses.stream().filter(r -> r.decision() == DecisionCode.PASS_PROBE).count();
         long openRejects = responses.stream()
                 .filter(r -> r.decision() == DecisionCode.REJECT_CIRCUIT_OPEN
                         || r.decision() == DecisionCode.REJECT_PROBE_FAILED).count();
-        assertEquals(1, probes, "冷静期后只能有 1 个探测请求穿透");
-        assertEquals(threads - 1, openRejects, "其余并发请求必须被快速失败");
+        log.info("case=probe-no-burst tenant=t1 threads={} fastFailed={}", threads, openRejects);
+        assertEquals(threads, openRejects, "探测在途期间其余并发请求必须全部被快速失败");
 
-        // 探测成功后恢复
-        assertEquals(DecisionCode.PASS, service.handle(req("t1", null, "p", "d")).decision());
+        // 放开探测：探测成功 -> 整体恢复
+        releaseProbe.countDown();
+        probeThread.join();
+        assertEquals(DecisionCode.PASS_PROBE, probeResponse.get().decision());
+        assertEquals(DecisionCode.PASS, blockingService.handle(req("t1", null, "p", "d")).decision());
     }
 
     @Test
